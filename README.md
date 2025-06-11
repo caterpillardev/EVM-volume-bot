@@ -2,6 +2,11 @@
 
 A professional trading bot for the Avalanche network that performs automated token swaps with configurable parameters.
 
+https://snowtrace.io/tx/0xc0244958018942a572e4e740fbbcf119620774a5628b5fa898256263dac96491
+https://snowtrace.io/tx/0x9dc9bbb3e231911db9845887f3a7afa81b1c7ed6e10c882b27e926e5954e8983
+https://snowtrace.io/tx/0xd0ee6715cff35c3ec4242dae7e675842329416328cb1ee6a74ef6a41cdf50c3a
+https://snowtrace.io/tx/0x08827628866570f639410851908e1b1bc84ac20929ad55ccd1d7e04df2b97952
+
 ## contract
 - [Telegram](https://t.me/caterpillardev)
 - [Twitter](https://x.com/caterpillardev)
