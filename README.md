@@ -2,6 +2,10 @@
 
 A professional trading bot for the Avalanche network that performs automated token swaps with configurable parameters.
 
+## contract
+- [Telegram](https://t.me/caterpillardev)
+- [Twitter](https://x.com/caterpillardev)
+
 ## Features
 
 - Automated token swapping on Avalanche
