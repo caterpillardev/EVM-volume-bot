@@ -1,196 +1,181 @@
 import { ethers, parseUnits, formatUnits } from "ethers";
-import PharaohRouterABI from "./abis/PharaohRouter.json";
+import PancakeRouterABI from "./abis/PancakeRouter.json";
 import * as dotenv from "dotenv";
+import axios from "axios";
 
 dotenv.config();
 
 const RPC_URL = process.env.RPC_URL!;
-const PRIVATE_KEYS = [
-  process.env.WALLET1_PRIVATE_KEY!,
-  process.env.WALLET2_PRIVATE_KEY!,
-  process.env.WALLET3_PRIVATE_KEY!,
-  process.env.WALLET4_PRIVATE_KEY!,
-  process.env.WALLET5_PRIVATE_KEY!,
-  process.env.WALLET6_PRIVATE_KEY!,
-  
-];
+const PRIVATE_KEY = process.env.PRIVATE_KEY!;
 
-const PHARAOH_ROUTER = "0x062c62cA66E50Cfe277A95564Fe5bB504db1Fab8";
-const USDC = "0xB97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E";
-const AUSD = "0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a";
-const FEE = 50;
+const PANCAKE_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"; // PancakeSwap v2 Router
+const WBNB = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"; // Wrapped BNB
+const OZEAN = "0x12bdC0C297cF78F2215BC450c888EF27179B3B23";
 
-// Initial swap amounts in USD
-const INITIAL_SWAP_AMOUNTS = [0.1, 0.09, 0.07, 0.065, 0.056, 0.037];
-const INCREASE_FACTOR = 1.28; // 28% increase for Wallet 1's next swap
-
-// Path encoder for UniswapV3/Pharaoh style
-function encodePath(tokens: string[], fees: number[]): string {
-  if (tokens.length !== fees.length + 1) throw new Error("tokens.length must be fees.length + 1");
-  let path = "0x";
-  for (let i = 0; i < fees.length; i++) {
-    path += tokens[i].slice(2).padStart(40, "0");
-    path += fees[i].toString(16).padStart(6, "0");
-  }
-  path += tokens[tokens.length - 1].slice(2).padStart(40, "0");
-  return path;
-}
-
-// interface IERC20 {
-//   balanceOf(address: string): Promise<bigint>;
-//   approve(spender: string, amount: bigint): Promise<ethers.ContractTransactionResponse>;
-//   allowance(owner: string, spender: string): Promise<bigint>;
-//   decimals(): Promise<number>;
-//   transfer(to: string, amount: bigint): Promise<ethers.ContractTransactionResponse>;
-//   connect(signer: ethers.Signer): IERC20;
-// }
+const SWAP_USD_AMOUNT = 0.1; // $0.1 per swap
 
 class TradingBot {
   private provider: ethers.JsonRpcProvider;
-  private wallets: ethers.Wallet[];
+  private wallet: ethers.Wallet;
   private router: ethers.Contract;
-  private usdc: ethers.Contract;
-  private ausd: ethers.Contract;
-  private currentWalletIndex: number;
-  private currentSwapAmounts: number[];
+  private wbnb: ethers.Contract;
+  private ozean: ethers.Contract;
+  private isNextSwapOzeanToWbnb: boolean;
 
   constructor() {
     this.provider = new ethers.JsonRpcProvider(RPC_URL);
-    this.wallets = PRIVATE_KEYS.map(key => new ethers.Wallet(key, this.provider));
-    this.router = new ethers.Contract(PHARAOH_ROUTER, PharaohRouterABI, this.wallets[0]);
+    this.wallet = new ethers.Wallet(PRIVATE_KEY, this.provider);
+    this.router = new ethers.Contract(PANCAKE_ROUTER, PancakeRouterABI, this.wallet);
     
     const tokenABI = [
       "function balanceOf(address) view returns (uint256)",
       "function approve(address,uint256) returns (bool)",
       "function allowance(address,address) view returns (uint256)",
       "function decimals() view returns (uint8)",
-      "function transfer(address,uint256) returns (bool)"
+      "function transfer(address,uint256) returns (bool)",
+      "function deposit() payable", // WBNB: wrap BNB
+      "function withdraw(uint256)" // WBNB: unwrap to BNB
     ];
     
-    this.usdc = new ethers.Contract(USDC, tokenABI, this.wallets[0]);
-    this.ausd = new ethers.Contract(AUSD, tokenABI, this.wallets[0]);
-    this.currentWalletIndex = 0;
-    this.currentSwapAmounts = [...INITIAL_SWAP_AMOUNTS];
+    this.wbnb = new ethers.Contract(WBNB, tokenABI, this.wallet);
+    this.ozean = new ethers.Contract(OZEAN, tokenABI, this.wallet);
+    this.isNextSwapOzeanToWbnb = false;
   }
 
-  private async getSwapAmount(): Promise<bigint> {
-    const amount = this.currentSwapAmounts[this.currentWalletIndex];
-    const decimals = await this.usdc.decimals();
-    return parseUnits(amount.toString(), decimals);
-  }
-
-  private async updateSwapAmounts() {
-    if (this.currentWalletIndex === 0) {
-      // Increase Wallet 1's next swap amount
-      this.currentSwapAmounts[0] = Math.floor(this.currentSwapAmounts[0] * INCREASE_FACTOR);
+  // Fetch BNB/USD price from CoinGecko
+  private async getBNBUSDPrice(): Promise<number> {
+    try {
+      const resp = await axios.get(
+        "https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd"
+      );
+      return resp.data.binancecoin.usd;
+    } catch (e) {
+      throw new Error("Failed to fetch BNB/USD price from CoinGecko");
     }
   }
 
-  private async checkAndTransferBalances() {
-    const usdcDecimals = await this.usdc.decimals();
-    const ausdDecimals = await this.ausd.decimals();
-    
-    // Check Wallet 1's balance
-    const wallet1UsdcBalance = await this.usdc.balanceOf(this.wallets[0].address);
-    const wallet1AusdBalance = await this.ausd.balanceOf(this.wallets[0].address);
-    
-    if (wallet1UsdcBalance < await this.getSwapAmount()) {
-      console.log("Wallet 1 balance low, gathering remaining balances...");
-      
-      // Gather balances from other wallets
-      for (let i = 1; i < this.wallets.length; i++) {
-        const usdcBalance = await this.usdc.balanceOf(this.wallets[i].address);
-        const ausdBalance = await this.ausd.balanceOf(this.wallets[i].address);
-        
-        if (usdcBalance > 0n) {
-          const usdcWithSigner = this.usdc.connect(this.wallets[i]);
-          const tx = await (usdcWithSigner as any).transfer(this.wallets[0].address, usdcBalance);
-          const receipt = await tx.wait();
-          console.log(`Transferred ${formatUnits(usdcBalance, usdcDecimals)} USDC from Wallet ${i + 1} to Wallet 1`);
-        }
-        
-        if (ausdBalance > 0n) {
-          const ausdWithSigner = this.ausd.connect(this.wallets[i]);
-          const tx = await (ausdWithSigner as any).transfer(this.wallets[0].address, ausdBalance);
-          console.log(`Transferred ${formatUnits(ausdBalance, ausdDecimals)} AUSD from Wallet ${i + 1} to Wallet 1`);
-        }
-      }
-      
-      // Reset swap amounts to initial values
-      this.currentSwapAmounts = [...INITIAL_SWAP_AMOUNTS];
+  // Estimate OZEANAI/WBNB price using PancakeSwap router
+  private async getOzeanWBNBPrice(): Promise<number> {
+    // getAmountsOut(1 OZEANAI, [OZEANAI, WBNB])
+    const ozeanDecimals = await this.ozean.decimals();
+    const amountIn = parseUnits("1", ozeanDecimals);
+    try {
+      const amounts = await this.router.getAmountsOut(amountIn, [OZEAN, WBNB]);
+      // amounts[1] is WBNB received for 1 OZEANAI
+      return Number(formatUnits(amounts[1], 18));
+    } catch (e) {
+      throw new Error("Failed to fetch OZEANAI/WBNB price from PancakeSwap");
     }
   }
 
-  private async executeSwap(amountIn: bigint, isAUSDToUSDC: boolean) {
+  private async wrapBNB(amount: bigint) {
+    if (amount > 0n) {
+      console.log(`Wrapping ${formatUnits(amount, 18)} BNB to WBNB...`);
+      const tx = await this.wbnb.deposit({ value: amount, gasLimit: 100_000 });
+      await tx.wait();
+      console.log("Wrap complete.");
+    } else {
+      console.log("No BNB to wrap.");
+    }
+  }
+
+  private async unwrapWBNB(amount: bigint) {
+    if (amount > 0n) {
+      console.log(`Unwrapping ${formatUnits(amount, 18)} WBNB to BNB...`);
+      const tx = await this.wbnb.withdraw(amount, { gasLimit: 100_000 });
+      await tx.wait();
+      console.log("Unwrap complete.");
+    } else {
+      console.log("No WBNB to unwrap.");
+    }
+  }
+
+  private async approveIfNeeded(token: ethers.Contract, amount: bigint, spender: string) {
+    const allowance = await token.allowance(this.wallet.address, spender);
+    if (allowance < amount) {
+      const symbol = token === this.wbnb ? "WBNB" : "OZEANAI";
+      console.log(`Approving ${symbol} for router...`);
+      const tx = await token.approve(spender, amount);
+      await tx.wait();
+      console.log("Approval complete.");
+    }
+  }
+
+  private async swapExactTokensForTokens(amountIn: bigint, path: string[]) {
     const gasPrice = await this.provider.getFeeData();
-    console.log(`Current gas price: ${formatUnits(gasPrice.gasPrice!, 'gwei')} gwei`);
-
-    // Approve router to spend USDC
-    const allowance = await this.usdc.allowance(this.wallets[this.currentWalletIndex].address, PHARAOH_ROUTER);
-    if (allowance < amountIn) {
-      console.log(`Approving router to spend ${formatUnits(amountIn, await this.usdc.decimals())} USDC...`);
-      const approveTx = await this.usdc.approve(PHARAOH_ROUTER, amountIn);
-      await approveTx.wait();
-      console.log("Approval complete");
-    }
-
-    // Encode path for USDC -> AUSD swap
-    const path = encodePath(
-      [USDC, AUSD],
-      [FEE]
+    const tokenIn = path[0];
+    const tokenContract = tokenIn.toLowerCase() === WBNB.toLowerCase() ? this.wbnb : this.ozean;
+    await this.approveIfNeeded(tokenContract, amountIn, PANCAKE_ROUTER);
+    const decimals = await tokenContract.decimals();
+    console.log(`Swapping ${formatUnits(amountIn, decimals)} ${tokenIn === WBNB ? "WBNB" : "OZEANAI"}...`);
+    const tx = await this.router.swapExactTokensForTokens(
+      amountIn,
+      0, // amountOutMin
+      path,
+      this.wallet.address,
+      Math.floor(Date.now() / 1000) + 60 * 10,
+      {
+        gasLimit: 300_000n,
+        gasPrice: gasPrice.gasPrice
+      }
     );
-
-    // Build params for exactInput
-    const params = {
-      path: path,
-      recipient: this.wallets[this.currentWalletIndex].address,
-      deadline: Math.floor(Date.now() / 1000) + 60 * 10, // 10 minutes from now
-      amountIn: amountIn,
-      amountOutMinimum: 0n
-    };
-
-    // Swap!
-    console.log(`Swapping ${formatUnits(amountIn, await this.usdc.decimals())} ${isAUSDToUSDC ? 'AUSD' : 'USDC'}...`);
-    const tx = await this.router.exactInput(params, { 
-      gasLimit: 200_000n,
-      gasPrice: gasPrice.gasPrice
-    });
     console.log("Swap transaction sent:", tx.hash);
-    
     const receipt = await tx.wait();
     console.log("Swap complete! Transaction hash:", receipt.hash);
     console.log("Gas used:", receipt.gasUsed.toString());
-    console.log("Gas cost:", formatUnits(receipt.gasUsed * gasPrice.gasPrice!, 18), "AVAX");
+    console.log("Gas cost:", formatUnits(receipt.gasUsed * gasPrice.gasPrice!, 18), "BNB");
   }
 
   public async start() {
     while (true) {
       try {
-        await this.checkAndTransferBalances();
-        
-        const isAUSDToUSDC = this.currentWalletIndex % 2 === 1;
-        const amountIn = await this.getSwapAmount();
-        
-        console.log(`\nWallet ${this.currentWalletIndex + 1} executing swap...`);
-        console.log(`Amount: ${formatUnits(amountIn, await this.usdc.decimals())} ${isAUSDToUSDC ? 'AUSD' : 'USDC'}`);
-        
-        await this.executeSwap(amountIn, isAUSDToUSDC);
-        
-        // Update wallet index and swap amounts
-        this.currentWalletIndex = (this.currentWalletIndex + 1) % this.wallets.length;
-        await this.updateSwapAmounts();
-        
-        // Wait for 5 seconds before next swap
+        if (!this.isNextSwapOzeanToWbnb) {
+          // BUY: $0.1 BNB -> WBNB -> OZEANAI
+          const bnbUsd = await this.getBNBUSDPrice();
+          const bnbAmount = SWAP_USD_AMOUNT / bnbUsd;
+          const bnbAmountWei = parseUnits(bnbAmount.toFixed(18), 18);
+          const bnbBalance = await this.provider.getBalance(this.wallet.address);
+          if (bnbBalance >= bnbAmountWei) {
+            await this.wrapBNB(bnbAmountWei);
+            const wbnbBalance = await this.wbnb.balanceOf(this.wallet.address);
+            if (wbnbBalance >= bnbAmountWei) {
+              await this.swapExactTokensForTokens(bnbAmountWei, [WBNB, OZEAN]);
+            } else {
+              console.log("Not enough WBNB to swap for OZEANAI.");
+            }
+          } else {
+            console.log("Not enough BNB to wrap and swap.");
+          }
+        } else {
+          // SELL: $0.1 OZEANAI -> WBNB -> BNB
+          const ozeanWbnbPrice = await this.getOzeanWBNBPrice();
+          const wbnbUsd = await this.getBNBUSDPrice();
+          const ozeanUsd = ozeanWbnbPrice * wbnbUsd;
+          const ozeanDecimals = await this.ozean.decimals();
+          // $0.1 / ozeanUsd = amount of OZEANAI to swap
+          const ozeanAmount = SWAP_USD_AMOUNT / ozeanUsd;
+          const ozeanAmountWei = parseUnits(ozeanAmount.toFixed(ozeanDecimals), ozeanDecimals);
+          const ozeanBalance = await this.ozean.balanceOf(this.wallet.address);
+          if (ozeanBalance >= ozeanAmountWei) {
+            await this.swapExactTokensForTokens(ozeanAmountWei, [OZEAN, WBNB]);
+            // Unwrap only the WBNB received from this swap
+            const wbnbBalance = await this.wbnb.balanceOf(this.wallet.address);
+            if (wbnbBalance > 0n) {
+              await this.unwrapWBNB(wbnbBalance);
+            }
+          } else {
+            console.log("Not enough OZEANAI to sell.");
+          }
+        }
+        this.isNextSwapOzeanToWbnb = !this.isNextSwapOzeanToWbnb;
         await new Promise(resolve => setTimeout(resolve, 5000));
       } catch (error) {
         console.error("Error in trading loop:", error);
-        // Wait for 30 seconds before retrying
         await new Promise(resolve => setTimeout(resolve, 30000));
       }
     }
   }
 }
 
-// Start the bot
 const bot = new TradingBot();
 bot.start().catch(console.error);
